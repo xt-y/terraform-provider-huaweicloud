@@ -14,7 +14,7 @@
                   "list",
                   "string"
                 ],
-                "description": "The ID list of resource nodes that used to refresh the deleting status.",
+                "description": "The ID list of resource nodes to be unsubscribed.",
                 "required": true
               },
               "region": {
@@ -28,7 +28,8 @@
                   "string"
                 ],
                 "description": "The ID list of resources to be deleted.",
-                "optional": true
+                "optional": true,
+                "deprecated": true
               },
               "resource_pool_name": {
                 "type": "string",

@@ -56,12 +56,14 @@ func ResourceV2NodeBatchUnsubscribe() *schema.Resource {
 				Type:        schema.TypeList,
 				Required:    true,
 				Elem:        &schema.Schema{Type: schema.TypeString},
-				Description: `The ID list of resource nodes that used to refresh the deleting status.`,
+				Description: `The ID list of resource nodes to be unsubscribed.`,
 			},
 			"resource_ids": {
-				Type:        schema.TypeList,
-				Optional:    true,
-				Elem:        &schema.Schema{Type: schema.TypeString},
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				Deprecated: `This parameter is deprecated, the resource IDs to unsubscribe are automatically resolved
+from the nodes, and no longer needs to be specified.`,
 				Description: `The ID list of resources to be deleted.`,
 			},
 			"enable_force_new": {
@@ -105,11 +107,37 @@ func waitForV2NodeBatchUnsubscribeCompleted(ctx context.Context, client *golangs
 	return err
 }
 
-func buildDeleteResourceIds(deleteNodeIds, deleteResourceIds []interface{}) []interface{} {
-	if len(deleteResourceIds) > 0 {
-		return deleteResourceIds
+// resolveV2NodeUnsubscribeResourceIds resolves the BSS resource IDs used to unsubscribe the specified nodes.
+// The A5 hyper nodes are subscribed in batches, the batch UID is used as the unsubscribe resource ID, and the
+// duplicate batch UIDs are removed. For other nodes, the node IDs themselves are used.
+// The node IDs that do not match any node are kept as-is to keep the unsubscribe behavior unchanged.
+func resolveV2NodeUnsubscribeResourceIds(nodes []interface{}, nodeIds []interface{}) []interface{} {
+	// The key is the node ID (the value of the 'os.modelarts/resource.id' label), and the value is the
+	// corresponding batch UID (the value of the 'os.modelarts.node/batch.uid' label).
+	nodeBatchUids := make(map[string]string)
+	for _, node := range nodes {
+		labels := utils.PathSearch(`metadata.labels`, node, nil)
+		resourceId := utils.PathSearch(`"os.modelarts/resource.id"`, labels, "").(string)
+		if resourceId == "" {
+			continue
+		}
+		nodeBatchUids[resourceId] = utils.PathSearch(`"os.modelarts.node/batch.uid"`, labels, "").(string)
 	}
-	return deleteNodeIds
+
+	resourceIdSet := make(map[string]struct{})
+	result := make([]interface{}, 0, len(nodeIds))
+	for _, nodeId := range utils.ExpandToStringList(nodeIds) {
+		// For the A5 hyper nodes, unsubscribe the batch to which the node belongs.
+		if batchUid := nodeBatchUids[nodeId]; batchUid != "" {
+			nodeId = batchUid
+		}
+		if _, ok := resourceIdSet[nodeId]; ok {
+			continue
+		}
+		resourceIdSet[nodeId] = struct{}{}
+		result = append(result, nodeId)
+	}
+	return result
 }
 
 func resourceV2NodeBatchUnsubscribeCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -121,16 +149,38 @@ func resourceV2NodeBatchUnsubscribeCreate(ctx context.Context, d *schema.Resourc
 		deleteResourceIds = d.Get("resource_ids").([]interface{})
 	)
 
-	client, err := cfg.NewServiceClient("bssv2", cfg.GetRegion(d))
+	bssClient, err := cfg.NewServiceClient("bssv2", cfg.GetRegion(d))
 	if err != nil {
 		return diag.Errorf("error creating BSS client: %s", err)
 	}
+
+	modelartsClient, err := cfg.NewServiceClient("modelarts", region)
+	if err != nil {
+		return diag.Errorf("error creating ModelArts client: %s", err)
+	}
+
+	// The parameter 'resource_ids' is deprecated, and the resource IDs to unsubscribe are automatically
+	// resolved from the nodes under the specified resource pool.
+	unsubscribeResourceIds := deleteResourceIds
+	if len(unsubscribeResourceIds) == 0 {
+		nodes, err := listV2ResourcePoolNodes(modelartsClient, resourcePoolName)
+		if err != nil {
+			if _, ok := err.(golangsdk.ErrDefault404); !ok {
+				return diag.Errorf("error querying nodes under specified resource pool (%s): %s", resourcePoolName, err)
+			}
+			// If the resource pool does not exist, it is considered that all nodes have been deleted, and the
+			// node IDs are used as the resource IDs to keep the unsubscribe behavior unchanged.
+			nodes = make([]interface{}, 0)
+		}
+		unsubscribeResourceIds = resolveV2NodeUnsubscribeResourceIds(nodes, deleteNodeIds)
+	}
+
 	// Delete
-	err = cbc.UnsubscribePrePaidResources(client, buildDeleteResourceIds(deleteNodeIds, deleteResourceIds))
+	err = cbc.UnsubscribePrePaidResources(bssClient, unsubscribeResourceIds)
 	if err != nil {
 		return diag.FromErr(err)
 	}
-	err = cbc.WaitForResourcesUnsubscribed(ctx, client, deleteNodeIds, d.Timeout(schema.TimeoutCreate))
+	err = cbc.WaitForResourcesUnsubscribed(ctx, bssClient, unsubscribeResourceIds, d.Timeout(schema.TimeoutCreate))
 	if err != nil {
 		return diag.Errorf("error waiting for all resources to be unsubscribed: %s ", err)
 	}
@@ -141,11 +191,7 @@ func resourceV2NodeBatchUnsubscribeCreate(ctx context.Context, d *schema.Resourc
 	}
 	d.SetId(randomUUID)
 
-	client, err = cfg.NewServiceClient("modelarts", region)
-	if err != nil {
-		return diag.Errorf("error creating ModelArts client: %s", err)
-	}
-	err = waitForV2NodeBatchUnsubscribeCompleted(ctx, client, resourcePoolName, deleteNodeIds,
+	err = waitForV2NodeBatchUnsubscribeCompleted(ctx, modelartsClient, resourcePoolName, deleteNodeIds,
 		d.Timeout(schema.TimeoutCreate))
 	if err != nil {
 		return diag.FromErr(err)
